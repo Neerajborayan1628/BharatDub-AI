@@ -1,4 +1,7 @@
 import os
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["CT2_NUM_THREADS"] = "1"
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 import importlib.util
 import gradio as gr
 
@@ -9,15 +12,7 @@ def install_if_not_installed(import_name, install_command):
     try:
         __import__(import_name)
     except ImportError:
-        os.system(f"{install_command} > /dev/null 2>&1")
-
-install_if_not_installed('protobuf', 'pip install protobuf==3.19.6')
-install_if_not_installed('spacy', 'pip install spacy==3.8.2')
-install_if_not_installed('TTS', 'pip install --no-deps TTS==0.21.0')
-install_if_not_installed('packaging', 'pip install packaging==20.9')
-install_if_not_installed('openai-whisper', 'pip install openai-whisper==20240930')
-install_if_not_installed('deepface', 'pip install deepface==0.0.93')
-os.system('pip install numpy==1.26.4 > /dev/null 2>&1')
+        os.system(f"{install_command} > NUL 2>&1")
 
 from pyannote.audio import Pipeline
 from audio_separator.separator import Separator
@@ -82,11 +77,11 @@ class VideoDubbing:
         self.Context_translation = Context_translation
         self.huggingface_auth_token = huggingface_auth_token
         
-        os.system("rm -r audio")
+        shutil.rmtree("audio", ignore_errors=True)
         os.system("mkdir audio")
 
 
-        os.system("rm -r results")
+        shutil.rmtree("results", ignore_errors=True)
         os.system("mkdir results")
         
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -140,7 +135,7 @@ class VideoDubbing:
                 frame_per_speaker.append(frame_speaker)
                 # print(time)
             
-            os.system("rm -r speakers_image")
+            shutil.rmtree("speakers_image", ignore_errors=True)
             os.system("mkdir speakers_image")
             
             
@@ -217,7 +212,7 @@ class VideoDubbing:
             
         ###############################################################################
         
-        os.system("rm -r speakers_audio")
+        shutil.rmtree("speakers_audio", ignore_errors=True)
         os.system("mkdir speakers_audio")
         
         speakers = set(list(speakers_rolls.values()))
@@ -237,7 +232,9 @@ class VideoDubbing:
         
         most_occured_speaker= max(list(speakers_rolls.values()),key=list(speakers_rolls.values()).count)
         
-        model = WhisperModel(self.whisper_model, device='cuda')
+        whisper_device = 'cpu'
+        whisper_compute_type = 'float16' if whisper_device == 'cuda' else 'int8'
+        model = WhisperModel(self.whisper_model, device=whisper_device, compute_type=whisper_compute_type)
         segments, info = model.transcribe(self.Video_path, word_timestamps=True)
         segments = list(segments) 
 			 
@@ -473,8 +470,8 @@ class VideoDubbing:
                 tts = TTS("tts_models/multilingual/multi-dataset/xtts_v2", gpu=False)
         #!tts --model_name "tts_models/multilingual/multi-dataset/xtts_v2"  --list_speaker_idxs
         
-        os.system("rm -r audio_chunks")
-        os.system("rm -r su_audio_chunks")
+        shutil.rmtree("audio_chunks", ignore_errors=True)
+        shutil.rmtree("su_audio_chunks", ignore_errors=True)
         os.system("mkdir audio_chunks")
         os.system("mkdir su_audio_chunks")
 
@@ -610,11 +607,13 @@ class VideoDubbing:
         
         # Video and Audio Overlay
         
-        command = f"ffmpeg -i '{self.Video_path}' -i audio/combined_audio.wav -c:v copy -map 0:v:0 -map 1:a:0 -shortest output_video.mp4"
-        subprocess.run(command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        command = ["ffmpeg", "-y", "-i", self.Video_path, "-i", "audio/combined_audio.wav", "-c:v", "copy", "-map", "0:v:0", "-map", "1:a:0", "-shortest", "output_video.mp4"]
+        result = subprocess.run(command, shell=False, capture_output=True, text=True)
+        if result.returncode != 0:
+            print("FFMPEG ERROR:", result.stderr)
         
         shutil.move(output_file_paths, "audio/")
-        # os.system('pip install -r requirements.txt > /dev/null 2>&1')
+        # os.system('pip install -r requirements.txt > NUL 2>&1')
         
         
         if self.Voice_denoising:
@@ -625,14 +624,16 @@ class VideoDubbing:
             enhanced = enhance(model, df_state, audio)
             # Save for listening
             save_audio("audio/enhanced.wav", enhanced, df_state.sr())"""
-            command = f"ffmpeg -i '{self.Video_path}' -i audio/output.wav -c:v copy -map 0:v:0 -map 1:a:0 -shortest denoised_video.mp4"
-            subprocess.run(command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            command = ["ffmpeg", "-i", self.Video_path, "-i", "audio/output.wav", "-c:v", "copy", "-map", "0:v:0", "-map", "1:a:0", "-shortest", "denoised_video.mp4", "-y"]
+            result = subprocess.run(command, shell=False, capture_output=True, text=True)
+            if result.returncode != 0:
+                print("FFMPEG ERROR:", result.stderr)
         if self.LipSync and self.Voice_denoising:
-            os.system("pip install librosa==0.9.1 > /dev/null 2>&1")
+            os.system("pip install librosa==0.9.1 > NUL 2>&1")
             os.system("cd Wav2Lip && python inference.py --checkpoint_path 'wav2lip_gan.pth' --face '../denoised_video.mp4' --audio '../audio/output.wav' --face_det_batch_size 1 --wav2lip_batch_size 1")
             
         if self.LipSync and not self.Voice_denoising:
-            os.system("pip install librosa==0.9.1 > /dev/null 2>&1")
+            os.system("pip install librosa==0.9.1 > NUL 2>&1")
             os.system("cd Wav2Lip && python inference.py --checkpoint_path 'wav2lip_gan.pth' --face '../output_video.mp4' --audio '../audio/combined_audio.wav' --face_det_batch_size 1 --wav2lip_batch_size 1")
 
 			 
@@ -908,3 +909,9 @@ with gr.Blocks(theme=THEME, css=CUSTOM_CSS, title="BharatDub AI") as demo:
 print("Launching Gradio interface...")
 demo.queue()
 demo.launch(share=True)
+
+
+
+
+
+

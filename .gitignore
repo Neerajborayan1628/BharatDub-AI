@@ -50,3 +50,4 @@ Thumbs.db
 
 
 .gradio/
+wav2vec2_checkpoints/
