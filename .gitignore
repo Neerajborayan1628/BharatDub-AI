@@ -47,3 +47,6 @@ huggingface_cache/
 # OS
 Thumbs.db
 .DS_Store
+
+
+.gradio/
