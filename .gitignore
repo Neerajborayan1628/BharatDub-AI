@@ -1,0 +1,49 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Generated videos/audio
+videos/
+audio/
+results/
+audio_chunks/
+su_audio_chunks/
+speakers_audio/
+speakers_image/
+*.mp4
+*.mkv
+*.mov
+*.avi
+*.wav
+*.mp3
+
+# AI model/cache files
+*.pth
+*.pt
+*.ckpt
+*.onnx
+*.safetensors
+models/
+checkpoints/
+
+# TTS / HuggingFace caches
+.cache/
+.cache/
+tts_cache/
+huggingface_cache/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Logs
+*.log
+
+# OS
+Thumbs.db
+.DS_Store
