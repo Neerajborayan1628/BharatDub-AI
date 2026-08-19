@@ -54,6 +54,12 @@ from tools.utils import cosine_similarity
 from tools.utils import extract_and_save_most_common_face
 from tools.utils import get_overlap
 from faster_whisper import WhisperModel
+import time
+
+# UI-only imports (theme/CSS/HTML helpers). These modules contain no
+# pipeline logic and cannot affect the dubbing backend.
+from ui.theme import THEME, CUSTOM_CSS
+from ui import components as ui_components
 
         
 nltk.download('punkt')
@@ -714,54 +720,190 @@ def process_video(video_file, youtube_url, source_language, target_language, use
         return None, f"Error: {str(e)}"
 
 
-with gr.Blocks(theme=gr.themes.Soft()) as demo:
-    gr.Markdown("# BharatDub AI")
-    gr.Markdown("This tool uses AI to dub videos into different languages!")
-    
-    with gr.Row():
-        with gr.Column(scale=2):
-                video_upload = gr.Video(label="Upload Video (Optional)",height=500, width=500)
-                youtube_url = gr.Textbox(label="YouTube URL (Optional)", placeholder="Enter YouTube URL")
-                source_language = gr.Dropdown(
-                    choices=list(language_mapping.keys()),  # You can use `language_mapping.keys()` here
-                    label="Source Language for Dubbing",
-                    value="English"
-                )
-                target_language = gr.Dropdown(
-                    choices=list(language_mapping.keys()),  # You can use `language_mapping.keys()` here
-                    label="Target Language for Dubbing",
-                    value="Hindi"
-                )
-                whisper_model = gr.Dropdown(
-                    choices=["tiny", "base", "small", "medium", "large"],
-                    label="Whisper Model",
-                    value="medium"
-                )
-                use_wav2lip = gr.Checkbox(
-                    label="Use Wav2Lip for lip sync",
-                    value=False,
-                    info="Enable this if the video has close-up faces. May not work for all videos."
-                )
-                
-                bg_sound = gr.Checkbox(
-                    label="Keep Background Sound",
-                    value=False,
-                    info="Keep background sound of the original video, may introduce noise."
-                )
-                submit_button = gr.Button("Process Video", variant="primary")
-        
-        with gr.Column(scale=2):
-            output_video = gr.Video(label="Processed Video",height=500, width=500)
-            error_message = gr.Textbox(label="Status/Error Message")
+# -----------------------------------------------------------------------
+# UI-only glue functions.
+#
+# These wrap `process_video` (unchanged above) to (a) show an immediate
+# "processing" state the instant the button is pressed, and (b) format its
+# existing return values (video path, status string) into the nicer status /
+# metadata panels. `process_video`'s signature, inputs and return contract
+# are never modified.
+# -----------------------------------------------------------------------
 
-    submit_button.click(
-        process_video, 
-        inputs=[video_upload, youtube_url, source_language, target_language, use_wav2lip, whisper_model, bg_sound], 
-        outputs=[output_video, error_message]
+def _start_processing():
+    """Fires immediately on click, before the (blocking) pipeline call."""
+    return (
+        gr.update(value="⏳ Processing…", interactive=False),   # submit_button
+        ui_components.processing_status_html(),                  # status_panel
+        gr.update(value=None),                                   # output_video (clear old result)
+        gr.update(visible=False),                                # result_meta (hide old metadata)
     )
 
 
-  
+def _run_pipeline(video_file, youtube_url, source_language, target_language,
+                   use_wav2lip, whisper_model, bg_sound):
+    """Calls the real, unmodified process_video() and formats its output."""
+    start_time = time.time()
+    result_path, message = process_video(
+        video_file, youtube_url, source_language, target_language,
+        use_wav2lip, whisper_model, bg_sound,
+    )
+    elapsed = time.time() - start_time
+
+    reset_button = gr.update(value="🚀 Start Dubbing", interactive=True)
+
+    if result_path and message == "No Error":
+        status_html = ui_components.success_status_html(elapsed)
+        meta_html = ui_components.result_metadata_html(
+            source_language, target_language, use_wav2lip, bg_sound, elapsed
+        )
+        return result_path, status_html, message, meta_html, gr.update(visible=True), reset_button
+
+    status_html = ui_components.error_status_html(message)
+    return None, status_html, message, "", gr.update(visible=False), reset_button
+
+
+def _swap_languages(source_language, target_language):
+    return target_language, source_language
+
+
+with gr.Blocks(theme=THEME, css=CUSTOM_CSS, title="BharatDub AI") as demo:
+
+    # ---------------------------------------------------------------- header
+    with gr.Row(elem_id="bd-header"):
+        with gr.Column(scale=0, min_width=48):
+            gr.Image(
+                "images/bharatdub_ai_logo.png",
+                show_label=False,
+                container=False,
+                interactive=False,
+                elem_id="bd-logo-img",
+                height=40,
+                width=40,
+                show_download_button=False,
+                show_fullscreen_button=False,
+            )
+        with gr.Column(scale=0, min_width=170):
+            gr.HTML(ui_components.BRAND_HTML)
+        with gr.Column(scale=1):
+            gr.HTML(ui_components.NAV_HTML)
+
+    # ------------------------------------------------------------------ hero
+    gr.HTML(ui_components.HERO_HTML)
+
+    # ------------------------------------------------------------- workspace
+    gr.HTML('<div id="bd-workspace"></div>' + ui_components.section_heading("Create your dub", "The Dubbing Workspace"))
+
+    with gr.Row():
+        # ------------------------------------------------------- left column
+        with gr.Column(scale=1):
+
+            with gr.Group(elem_classes=["bd-step-card"]):
+                gr.HTML(ui_components.step_head("1", "Choose your video", "Upload a file or paste a YouTube link."))
+                video_upload = gr.Video(label="Upload Video (Optional)", height=320, elem_classes=["bd-video"])
+                gr.HTML('<div id="bd-upload-hint">MP4 • MOV • MKV • AVI</div>')
+                youtube_url = gr.Textbox(
+                    label="Or paste a YouTube URL",
+                    placeholder="https://youtube.com/...",
+                    max_lines=1,
+                )
+
+            with gr.Group(elem_classes=["bd-step-card"]):
+                gr.HTML(ui_components.step_head("2", "Language", "Choose what your speakers say, and what they'll say instead."))
+                with gr.Row():
+                    source_language = gr.Dropdown(
+                        choices=[(f"{ui_components.lang_label(k)}", k) for k in language_mapping.keys()],
+                        label="Source Language",
+                        value="English",
+                    )
+                    swap_btn = gr.Button("⇄", elem_id="bd-swap-btn", variant="secondary")
+                    target_language = gr.Dropdown(
+                        choices=[(f"{ui_components.lang_label(k)}", k) for k in language_mapping.keys()],
+                        label="Target Language",
+                        value="Hindi",
+                    )
+
+            with gr.Group(elem_classes=["bd-step-card"]):
+                gr.HTML(ui_components.step_head("3", "Voice & Audio", "Voice cloning and emotion are handled automatically by the pipeline."))
+                gr.HTML(ui_components.AUTO_BADGES_HTML)
+                bg_sound = gr.Checkbox(
+                    label="Keep Background Sound",
+                    value=False,
+                    info="Keep background sound of the original video, may introduce noise.",
+                )
+
+            with gr.Accordion("Advanced Settings", open=False, elem_classes=["bd-step-card"]):
+                whisper_model = gr.Dropdown(
+                    choices=[
+                        ("Tiny — fastest, lowest accuracy", "tiny"),
+                        ("Base — fast, good for quick drafts", "base"),
+                        ("Small — balanced speed/accuracy", "small"),
+                        ("Medium — recommended, high accuracy", "medium"),
+                        ("Large — best accuracy, slowest", "large"),
+                    ],
+                    label="Whisper Model",
+                    value="medium",
+                )
+                use_wav2lip = gr.Checkbox(
+                    label="Lip Sync (Wav2Lip)",
+                    value=False,
+                    info="Enable this if the video has close-up faces. May not work for all videos.",
+                )
+
+            submit_button = gr.Button("🚀 Start Dubbing", variant="primary", elem_id="bd-submit", size="lg")
+
+        # ------------------------------------------------------ right column
+        with gr.Column(scale=1):
+            with gr.Group(elem_classes=["bd-step-card"]):
+                status_panel = gr.HTML(ui_components.idle_status_html())
+                output_video = gr.Video(label="Your Dubbed Video", height=320, elem_classes=["bd-video"])
+                with gr.Column(visible=False) as result_meta_group:
+                    result_meta = gr.HTML()
+                with gr.Accordion("Technical details", open=False):
+                    error_message = gr.Textbox(label="Status message", interactive=False, show_label=False)
+
+    submit_button.click(
+        _start_processing,
+        outputs=[submit_button, status_panel, output_video, result_meta_group],
+    ).then(
+        _run_pipeline,
+        inputs=[video_upload, youtube_url, source_language, target_language, use_wav2lip, whisper_model, bg_sound],
+        outputs=[output_video, status_panel, error_message, result_meta, result_meta_group, submit_button],
+    )
+
+    swap_btn.click(_swap_languages, inputs=[source_language, target_language], outputs=[source_language, target_language])
+
+    # ------------------------------------------------------------ features
+    gr.HTML(ui_components.section_heading("Capabilities", "Everything you need for AI dubbing"))
+    gr.HTML(ui_components.feature_cards_html())
+
+    # --------------------------------------------------------- how it works
+    gr.HTML(ui_components.section_heading("Process", "How It Works"))
+    gr.HTML(ui_components.how_it_works_html())
+
+    # --------------------------------------------------------- languages
+    gr.HTML('<div id="bd-languages"></div>' + ui_components.section_heading(
+        "Supported Languages", f"{len(language_mapping)} languages, Hindi at the heart"
+    ))
+    gr.HTML(
+        '<div class="bd-tech-chips">'
+        + "".join(
+            f'<span class="bd-tech-chip">{ui_components.lang_label(name)}</span>'
+            for name in language_mapping.keys()
+        )
+        + "</div>"
+    )
+
+    # --------------------------------------------------------------- tech
+    gr.HTML(ui_components.section_heading("Under the hood", "Powered by open-source AI"))
+    gr.HTML(ui_components.tech_stack_html())
+
+    # ------------------------------------------------------------ responsible use
+    gr.HTML(ui_components.RESPONSIBLE_USE_HTML)
+
+    # ----------------------------------------------------------------- footer
+    gr.HTML(ui_components.FOOTER_HTML)
+
 
 print("Launching Gradio interface...")
 demo.queue()
