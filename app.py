@@ -62,6 +62,80 @@ warnings.filterwarnings("ignore")
 load_dotenv()
 
 
+# ---------------------------------------------------------------------------
+# Robust media / translation helpers
+# ---------------------------------------------------------------------------
+
+TRANSLATION_MODEL_MAP = {
+    ("en", "ja"): "Helsinki-NLP/opus-mt-en-jap",
+    ("en", "hi"): "Helsinki-NLP/opus-mt-en-hi",
+    ("en", "de"): "Helsinki-NLP/opus-mt-en-de",
+    ("en", "fr"): "Helsinki-NLP/opus-mt-en-fr",
+    ("en", "es"): "Helsinki-NLP/opus-mt-en-es",
+    ("en", "it"): "Helsinki-NLP/opus-mt-en-it",
+    ("en", "nl"): "Helsinki-NLP/opus-mt-en-nl",
+    ("en", "ru"): "Helsinki-NLP/opus-mt-en-ru",
+    ("en", "cs"): "Helsinki-NLP/opus-mt-en-cs",
+    ("en", "ar"): "Helsinki-NLP/opus-mt-en-ar",
+    ("en", "ko"): "Helsinki-NLP/opus-mt-en-ko",
+    ("en", "hu"): "Helsinki-NLP/opus-mt-en-hu",
+}
+_MARIAN_CACHE = {}
+
+def _run_ffmpeg(args, description="FFmpeg"):
+    result = subprocess.run(
+        args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"{description} failed:\n{result.stderr[-4000:]}")
+    return result
+
+def _media_has_audio(video_path):
+    result = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "a:0",
+         "-show_entries", "stream=index", "-of", "csv=p=0", video_path],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+    )
+    return bool(result.stdout.strip())
+
+def _extract_wav(video_path, wav_path):
+    if not _media_has_audio(video_path):
+        raise RuntimeError(
+            "The uploaded video does not contain an audio stream."
+        )
+    _run_ffmpeg(
+        ["ffmpeg", "-y", "-i", video_path, "-map", "0:a:0", "-vn",
+         "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", wav_path],
+        "Audio extraction"
+    )
+
+def _get_translation_model_name(source_language, target_language):
+    pair = (source_language, target_language)
+    if pair in TRANSLATION_MODEL_MAP:
+        return TRANSLATION_MODEL_MAP[pair]
+    if source_language == "tr":
+        return f"Helsinki-NLP/opus-mt-trk-{target_language}"
+    if target_language == "tr":
+        return f"Helsinki-NLP/opus-mt-{source_language}-trk"
+    if source_language == "zh-cn":
+        return f"Helsinki-NLP/opus-mt-zh-{target_language}"
+    if target_language == "zh-cn":
+        return f"Helsinki-NLP/opus-mt-{source_language}-zh"
+    if target_language == "ja":
+        return f"Helsinki-NLP/opus-mt-{source_language}-jap"
+    return f"Helsinki-NLP/opus-mt-{source_language}-{target_language}"
+
+def _get_marian(source_language, target_language, device):
+    model_name = _get_translation_model_name(source_language, target_language)
+    if model_name not in _MARIAN_CACHE:
+        print(f"Loading translation model: {model_name}")
+        tokenizer = MarianTokenizer.from_pretrained(model_name)
+        model = MarianMTModel.from_pretrained(model_name).to(device)
+        model.eval()
+        _MARIAN_CACHE[model_name] = (tokenizer, model)
+    return model_name, *_MARIAN_CACHE[model_name]
+
+
 
 class VideoDubbing:
     def __init__(self, Video_path, source_language, target_language, 
@@ -90,12 +164,10 @@ class VideoDubbing:
         pipeline = Pipeline.from_pretrained("pyannote/speaker-diarization",
                                      use_auth_token=self.huggingface_auth_token).to(device)
         
-        # Load the audio from the video file
-        audio = AudioSegment.from_file(self.Video_path, format="mp4")
-        audio.export("audio/test0.wav", format="wav")
-        
-        
+        # Explicitly extract the first audio stream as WAV.
         audio_file = "audio/test0.wav"
+        _extract_wav(self.Video_path, audio_file)
+        print(f"Audio extracted successfully: {audio_file}")
         
         # Apply the diarization pipeline on the audio file
         diarization = pipeline(audio_file)
@@ -216,7 +288,7 @@ class VideoDubbing:
         os.system("mkdir speakers_audio")
         
         speakers = set(list(speakers_rolls.values()))
-        audio = AudioSegment.from_file(audio_file, format="mp4")
+        audio = AudioSegment.from_file(audio_file, format="wav")
         
         for speaker in speakers:
             speaker_audio = AudioSegment.empty()
@@ -362,22 +434,15 @@ class VideoDubbing:
 
             # Function to translate text
             def translate(sentence):
-                if self.source_language == 'tr':
-                    model_name = f"Helsinki-NLP/opus-mt-trk-{self.target_language}"
-                elif self.target_language == 'tr':
-                    model_name = f"Helsinki-NLP/opus-mt-{self.source_language}-trk"
-                elif self.source_language == 'zh-cn':
-                    model_name = f"Helsinki-NLP/opus-mt-zh-{self.target_language}"
-                elif self.target_language == 'zh-cn':
-                    model_name = f"Helsinki-NLP/opus-mt-{self.source_language}-zh"
-                else:
-                    model_name = f"Helsinki-NLP/opus-mt-{self.source_language}-{self.target_language}"
-	
-                tokenizer = MarianTokenizer.from_pretrained(model_name)
-                model = MarianMTModel.from_pretrained(model_name).to(device)
-
-                inputs = tokenizer([sentence], return_tensors="pt", padding=True).to(device)
-                translated = model.generate(**inputs)
+                model_name, tokenizer, model = _get_marian(
+                    self.source_language, self.target_language, device
+                )
+                print(f"Translating with: {model_name}")
+                inputs = tokenizer(
+                    [sentence], return_tensors="pt", padding=True, truncation=True
+                ).to(device)
+                with torch.no_grad():
+                    translated = model.generate(**inputs)
                 return tokenizer.decode(translated[0], skip_special_tokens=True)
         else:
             client = Groq(api_key=self.Context_translation)
@@ -421,7 +486,7 @@ class VideoDubbing:
         
         records = []
         
-        audio = AudioSegment.from_file(audio_file, format="mp4")
+        audio = AudioSegment.from_file(audio_file, format="wav")
         for i in range(len(new_record)):
             final_sentance = new_record[i][0]
             if not self.Context_translation:
@@ -516,22 +581,87 @@ class VideoDubbing:
             output_file = f"su_audio_chunks/{i}.wav"
 
            
-            if theta <1 and theta > 0.44:
-                print('############################')
-                theta_prim = (lo+previous_silence_time)/lt
-                command = f"ffmpeg -i {input_file} -filter:a 'atempo={1/theta_prim}' -vn {output_file}"
-                process = subprocess.run(command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-                if process.returncode != 0:
-                    sc = lo  + previous_silence_time
-                    silence = AudioSegment.silent(duration=(sc*1000))
-                    silence.export(output_file, format="wav")
-            elif theta < 0.44:
-                silence = AudioSegment.silent(duration=((lo+previous_silence_time)*1000))
-                silence.export(output_file, format="wav")
+            # ------------------------------------------------------------------
+            # Timing correction
+            #
+            # IMPORTANT: The old code used:
+            #   shell=True + "-filter:a 'atempo=...'"
+            # on Windows. The single quotes are Unix-style quoting and can make
+            # FFmpeg reject the filter. The old fallback then replaced the
+            # generated speech with SILENCE.
+            #
+            # Use a subprocess argument list instead and never replace a valid
+            # TTS chunk with silence just because timing correction failed.
+            # ------------------------------------------------------------------
+
+            target_duration = max(lo + previous_silence_time, 0.05)
+            current_duration = max(lt, 0.05)
+
+            # Desired atempo value:
+            # output duration ~= input duration / atempo
+            desired_atempo = current_duration / target_duration
+
+            def _atempo_filter(value):
+                """Build an FFmpeg atempo chain; each stage must be 0.5..2.0."""
+                value = max(0.5, min(4.0, float(value)))
+                filters = []
+
+                while value > 2.0:
+                    filters.append("atempo=2.0")
+                    value /= 2.0
+
+                while value < 0.5:
+                    filters.append("atempo=0.5")
+                    value /= 0.5
+
+                filters.append(f"atempo={value:.8f}")
+                return ",".join(filters)
+
+            # Keep the natural silence before this speaker/segment.
+            prefix_silence = AudioSegment.silent(
+                duration=int(previous_silence_time * 1000)
+            )
+
+            if abs(current_duration - target_duration) > 0.02:
+                filter_chain = _atempo_filter(desired_atempo)
+
+                command = [
+                    "ffmpeg", "-y",
+                    "-i", input_file,
+                    "-vn",
+                    "-af", filter_chain,
+                    "-ar", "24000",
+                    "-ac", "1",
+                    "-c:a", "pcm_s16le",
+                    output_file,
+                ]
+
+                process = subprocess.run(
+                    command,
+                    shell=False,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+
+                if process.returncode != 0 or not os.path.exists(output_file):
+                    # Do NOT create a silent replacement. Keep the real XTTS
+                    # audio so a timing failure cannot destroy the voice.
+                    print("WARNING: FFmpeg timing correction failed.")
+                    print(process.stderr[-3000:])
+
+                    shutil.copyfile(input_file, output_file)
+                    audio = AudioSegment.from_file(output_file)
+                else:
+                    audio = AudioSegment.from_file(output_file)
             else:
-                silence = AudioSegment.silent(duration=(previous_silence_time*1000))
-                audio = silence  + audio
+                # No timing correction required; preserve the actual XTTS audio.
+                audio = AudioSegment.from_file(input_file)
                 audio.export(output_file, format="wav")
+
+            # Add the natural silence before the generated speech.
+            audio = prefix_silence + audio
+            audio.export(output_file, format="wav")
         
                 
             audio = AudioSegment.from_file(output_file)
@@ -558,6 +688,28 @@ class VideoDubbing:
             print("#######diff######: ",lo-lt)
             print("lo: ", lo)
             print("lt: ", lt)
+
+            # Confirm the processed chunk is not silent before concatenation.
+            try:
+                chunk_check = subprocess.run(
+                    [
+                        "ffmpeg", "-v", "error",
+                        "-i", output_file,
+                        "-af", "volumedetect",
+                        "-f", "null", "NUL",
+                    ],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                volume_lines = [
+                    line.strip()
+                    for line in chunk_check.stderr.splitlines()
+                    if "mean_volume:" in line or "max_volume:" in line
+                ]
+                print(f"Processed chunk {i} volume: {volume_lines[-2:]}")
+            except Exception as volume_error:
+                print(f"Volume check skipped: {volume_error}")
             
         
        
@@ -607,10 +759,23 @@ class VideoDubbing:
         
         # Video and Audio Overlay
         
-        command = ["ffmpeg", "-y", "-i", self.Video_path, "-i", "audio/combined_audio.wav", "-c:v", "copy", "-map", "0:v:0", "-map", "1:a:0", "-shortest", "output_video.mp4"]
+        command = [
+            "ffmpeg", "-y",
+            "-i", self.Video_path,
+            "-i", "audio/combined_audio.wav",
+            "-map", "0:v:0",
+            "-map", "1:a:0",
+            "-c:v", "copy",
+            "-c:a", "aac",
+            "-b:a", "192k",
+            "-ar", "48000",
+            "-ac", "2",
+            "-shortest",
+            "output_video.mp4",
+        ]
         result = subprocess.run(command, shell=False, capture_output=True, text=True)
         if result.returncode != 0:
-            print("FFMPEG ERROR:", result.stderr)
+            raise RuntimeError(f"FFmpeg output mux failed:\n{result.stderr[-4000:]}")
         
         shutil.move(output_file_paths, "audio/")
         # os.system('pip install -r requirements.txt > NUL 2>&1')
@@ -624,10 +789,23 @@ class VideoDubbing:
             enhanced = enhance(model, df_state, audio)
             # Save for listening
             save_audio("audio/enhanced.wav", enhanced, df_state.sr())"""
-            command = ["ffmpeg", "-i", self.Video_path, "-i", "audio/output.wav", "-c:v", "copy", "-map", "0:v:0", "-map", "1:a:0", "-shortest", "denoised_video.mp4", "-y"]
+            command = [
+                "ffmpeg", "-y",
+                "-i", self.Video_path,
+                "-i", "audio/output.wav",
+                "-map", "0:v:0",
+                "-map", "1:a:0",
+                "-c:v", "copy",
+                "-c:a", "aac",
+                "-b:a", "192k",
+                "-ar", "48000",
+                "-ac", "2",
+                "-shortest",
+                "denoised_video.mp4",
+            ]
             result = subprocess.run(command, shell=False, capture_output=True, text=True)
             if result.returncode != 0:
-                print("FFMPEG ERROR:", result.stderr)
+                raise RuntimeError(f"FFmpeg denoised-video mux failed:\n{result.stderr[-4000:]}")
         if self.LipSync and self.Voice_denoising:
             os.system("pip install librosa==0.9.1 > NUL 2>&1")
             os.system("cd Wav2Lip && python inference.py --checkpoint_path 'wav2lip_gan.pth' --face '../denoised_video.mp4' --audio '../audio/output.wav' --face_det_batch_size 1 --wav2lip_batch_size 1")
@@ -699,6 +877,12 @@ def process_video(video_file, youtube_url, source_language, target_language, use
         else:
             return None, "Please upload a video or enter a YouTube URL."
 
+        print(f"RUNNING APP: {os.path.abspath(__file__)}")
+        print(f"INPUT VIDEO: {os.path.abspath(video_path)}")
+        print(f"SOURCE: {source_language} -> {language_mapping[source_language]}")
+        print(f"TARGET: {target_language} -> {language_mapping[target_language]}")
+        print(f"INPUT HAS AUDIO: {_media_has_audio(video_path)}")
+
         BharatDub = VideoDubbing(video_path, language_mapping[source_language], language_mapping[target_language], use_wav2lip, not bg_sound, whisper_model, "", os.getenv('HF_TOKEN'))
         if  use_wav2lip and not bg_sound:
             source_path = 'results/result_voice.mp4'
@@ -714,6 +898,11 @@ def process_video(video_file, youtube_url, source_language, target_language, use
         else:
             source_path = 'results/output_video.mp4'
         
+        if not os.path.exists(source_path):
+            return None, f"Pipeline finished but output was not found: {source_path}"
+
+        print(f"FINAL OUTPUT: {os.path.abspath(source_path)}")
+        print(f"FINAL OUTPUT HAS AUDIO: {_media_has_audio(source_path)}")
         return source_path, "No Error"
 
     except Exception as e:
@@ -909,9 +1098,4 @@ with gr.Blocks(theme=THEME, css=CUSTOM_CSS, title="BharatDub AI") as demo:
 print("Launching Gradio interface...")
 demo.queue()
 demo.launch(share=True)
-
-
-
-
-
 
